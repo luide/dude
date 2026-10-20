@@ -1,0 +1,272 @@
+================================================================================
+MODIFICATIONS LOG - branch `purge-sqlite-workerd` (dude fork of opencode)
+================================================================================
+This file records the SQLite/workerd -> PostgreSQL migration plus the follow-up
+cleanup performed on this branch. Nothing here is committed yet: the whole set
+is uncommitted working-tree state on top of `133b1ebfaf` (== origin/dev).
+
+Note: parts of the working tree were already modified before this record (e.g.
+the Discord de-branding of README/i18n and the new release workflow). Only the
+database migration, test isolation, branding plumbing and the SQLite vestige
+cleanup described below were authored/verified here.
+
+--------------------------------------------------------------------------------
+1. SCOPE
+--------------------------------------------------------------------------------
+- Replace the SQLite/workerd storage stack with PostgreSQL.
+- Keep every shared call site working (the fork uses `db.select()...get()`,
+  `.all()`, `.run()` everywhere; PostgreSQL drizzle only ships `.execute()`).
+- Preserve SQLite runtime semantics where call sites/expected output depend on
+  them (byte-order text comparison, NULL ordering, JSON helpers, counts).
+- Give the test suite per-test isolation again (SQLite used one temp file/test).
+- Remove every functional trace of SQLite/workerd.
+
+--------------------------------------------------------------------------------
+2. DATABASE LAYER: SQLite/workerd -> PostgreSQL
+--------------------------------------------------------------------------------
+Added
+  packages/core/src/database/pg.ts
+      pgLayer({ schema }) builds an `@effect/sql-pg` PgClient layer from
+      OPENCODE_DATABASE_URL, else PGHOST/PGDATABASE/PGUSER (default socket
+      /run/postgresql, db `opencode`, user `opencode`).
+      - When `schema` is set, every physical connection pins `search_path`.
+      - Wrapped in `Layer.orDie`: a connection failure is a boot defect, so the
+        layer graph keeps its `never` error contract (matches `Effect.orDie`
+        already used for the database effect).
+      - `OPENCODE_DATABASE_IDLE_TIMEOUT` (ms) overrides the pool idle timeout;
+        tests set it high because TestClock jumps otherwise reap connections.
+  packages/core/src/database/pg-schema.ts
+      Postgres table/column helpers: `table = pgTable`, a `json` customType that
+      stores jsonb (stringifies on write, driver decodes on read),
+      `integer`/`real` -> `double precision` (int8 returns BigInt and int4
+      overflows epoch-ms), and `inDirectorySubtree(column, directory)`.
+  packages/core/src/database/drizzle-pg.ts + drizzle/index.ts
+      `EffectDrizzlePg` facade over the vendored pg effect layer.
+  packages/core/src/database/drizzle/pg-core/effect/*  (vendored)
+      select/insert/update/delete/count/raw/query/db/session around drizzle's
+      pg-core builders, adapted to run over Effect's generic SqlClient.
+  packages/core/src/database/drizzle/effect-pg/{driver,session,index}.ts
+      EffectPgDatabase / EffectPgSession / EffectPgTransaction, HKT
+      `EffectPgQueryEffectHKT` (error EffectDrizzleQueryError, context never).
+
+Deleted (SQLite/workerd stack)
+  packages/core/src/database/sqlite.{ts,bun.ts,node.ts,workerd.ts}
+  packages/core/src/database/v1-migration.bun.ts
+  packages/core/src/database/drizzle/effect-sqlite/{driver,index,session}.ts
+  packages/core/src/database/drizzle/sqlite-core/effect/*  (count, db, delete,
+      index, insert, query, raw, select, session, update)
+  packages/core/src/database/migration/20260*.ts  (all drizzle migrations)
+  packages/core/src/filesystem/fff.workerd.ts
+  packages/core/src/image/photon-wasm.workerd.ts
+  packages/core/src/persistent-pty/binary.workerd.ts
+  packages/core/src/pty/pty.workerd.ts
+  packages/core/src/shell/parser-wasm.workerd.ts
+  packages/core/test/{database-drizzle,database-migration,database,sqlite-bundle,
+      sqlite-workerd,v1-migration}.test.ts
+  packages/core/test/fixture/durable-object-storage.ts
+  packages/sdk/src/{workerd.ts,internal/workerd.ts,effect/workerd.ts}
+  packages/sdk/script/verify-package.ts
+  packages/server/src/workerd.ts, packages/server/script/workerd-probe.ts,
+  packages/server/test/workerd.test.ts
+  packages/util/src/{global-roots.workerd.ts,runtime/import.workerd.ts}
+  packages/effect-drizzle-sqlite examples/sst-env.d.ts
+
+Wiring
+  packages/core/src/database/database.ts
+      - `makeDatabase = EffectDrizzlePg.makeWithDefaults()`.
+      - `Options = { schema?: string }` (see §6 for the removed `path`).
+      - `layer(options = {})` resolves `options.schema ?? OPENCODE_DATABASE_SCHEMA`
+        at build time via `Layer.unwrap`, creates the schema
+        (`CREATE SCHEMA IF NOT EXISTS`) and bootstraps migrations behind a
+        per-instance Semaphore.
+      - `node = configured()`.
+  packages/core/src/database/schema.gen.ts
+      Hand-maintained PostgreSQL DDL ported from the SQLite schema:
+      `ident` -> "ident", integer/real -> double precision, boolean -> boolean,
+      text({mode:"json"}) -> jsonb; FKs added with ALTER after tables exist.
+      Also defines the SQLite-compatibility `json_extract(jsonb, text)` function
+      so existing raw queries keep working.
+  packages/core/src/database/migration.ts
+      Bootstrap for the shared server:
+      - `Transaction = PgEffectTransaction<any, any, any>`.
+      - `Migration.up: (tx) => Effect<void, unknown>` (no Global requirement).
+      - Bootstrap transaction takes `pg_advisory_xact_lock(
+        hashtext('opencode:database:bootstrap')::bigint)` and re-checks
+        `pg_tables` before DDL, so concurrent layers/processes sharing one DB
+        serialize instead of racing `CREATE OR REPLACE FUNCTION`.
+  packages/core/src/database/migration.gen.ts
+      `migrations: DatabaseMigration.Migration[] = []` (typed empty array).
+  packages/core/script/migration.ts + packages/core/schema.json  -> REMOVED
+      The drizzle-kit generator flow was stale (snapshot still `dialect:sqlite`,
+      `bun run migration --check` failed with "not of the latest version").
+      `schema.gen.ts` is now maintained source. `drizzle.config.ts` + the `db`
+      script (drizzle-kit CLI, dialect `postgresql`) remain.
+
+Vendored-layer adaptations (the blocker that caused ~1259 type errors)
+  - `PgEffectPreparedQuery` gained `run/all/get/values` (mirroring the SQLite
+    prepared query) plus a shared `executeMapped(ph, applyMapper)`:
+      execute/all/run -> mapped result, get -> first row, values -> unmapped.
+  - select/insert/update/delete builders gained `run/all/get/values` delegating
+    to `_prepare()`, and their `...Prepare` configs include those keys.
+  - Moved `run/all/get/values` onto base `PgEffectDatabase` so the
+    `transaction` callback uses the base `PgEffectTransaction` type; the derived
+    `EffectPgTransaction` type silently collapsed `Effect.gen` inference to
+    `unknown` (broke credential/project/worktree/session-transfer typings).
+  - `select.ts`: `_resolveSelection` exists at runtime on PgSelectBase but is
+    not in rc.5's published types -> cast.
+  - `db.ts` `$with`: guard `withoutSelectionCastCodecs`/`getSelectedFields`
+    through a structural cast; cast `sql.usedTables`.
+  - `session.ts`: `SqlError` from `effect/sql/SqlError` (published pg-core/effect
+    still imports `effect/unstable/sql/SqlError`, which does not exist in
+    effect@4.0.1); `config.init` cast; `upgradeIfNeeded(session as any)`.
+  - `internal/drizzle-utils.ts`: `.sql` access cast for `Aliased|PgColumn`.
+
+--------------------------------------------------------------------------------
+3. POSTGRES SEMANTICS: restorations required by the port
+--------------------------------------------------------------------------------
+- COLLATE "C" for byte-order text ranges (locale collation is pt_BR.UTF-8 here).
+    pg-schema.ts: `inDirectorySubtree(column, directory)` =
+      `column collate "C" >= dir and column collate "C" <= dir || U+FFFF`.
+    project.ts (project adoption) and session/projector.ts (Worktree.Resolved
+    session repointing) now use it. Before: locale collation sorted U+FFFF
+    before "/" so nested sessions/projects were never matched.
+    kv.ts: KV prefix scan pins COLLATE "C" on the bounds and ORDER BY; before,
+    `KV.scan` returned nothing and background-job recovery was empty.
+- NULL ordering: SQLite sorts NULL first on ASC, Postgres last.
+    credential.ts `all`/`list` order `active asc nulls first`.
+- SQLite JSON helpers (Postgres has no json_set/json_remove/json_each):
+    session/stats.ts: `json_each(msg.data,'$.content')` ->
+      `jsonb_array_elements(msg.data -> 'content') AS content(value)`;
+      numeric extracts cast `::double precision`; `count(*)` cast `::int`
+      (Postgres returns BigInt);
+      camelCase aliases quoted (`AS "sessionID"`, `AS "timeCreated"`, ...)
+      because Postgres folds unquoted aliases to lowercase.
+    tests: `json_set(json_remove(...))` -> `jsonb_set(data - 'native', ...)`;
+      `json_set(data, '$.content[0]...')` -> `jsonb_set(data, '{content,0,...}')`.
+- Raw SQL SQLite-isms:
+    tests/session-projector: `INSERT OR IGNORE` -> `ON CONFLICT DO NOTHING`.
+    credential test legacy insert: boolean column written as `TRUE` not `1`.
+    bus.ts: `max(a,b)` -> `greatest(a,b)`; dropped sqlite `{ behavior:"immediate" }`
+      transaction config from `db.transaction(...)`.
+    workspace/sql.ts: `sqliteTable` -> pg `table`, `text({mode:"json"})` -> `json`.
+- workspace.ts idle monitor: reads the persisted binding from an in-memory Ref
+  (`connection.binding`, updated by `saveBinding`) instead of an async DB read,
+  so `TestClock.adjust` completes the suspension synchronously.
+- Timestamp columns are `double precision` so epoch-ms > 2^31 work.
+
+--------------------------------------------------------------------------------
+4. TEST INFRASTRUCTURE: per-schema isolation
+--------------------------------------------------------------------------------
+Postgres is one shared database; the old suite relied on one temp SQLite file
+per test. Now:
+  packages/core/test/lib/effect.ts (`testEffect`/`it`/`live` harness)
+    - Each test gets `OPENCODE_DATABASE_SCHEMA=oc_test_<uuid>`, created before
+      the body and dropped (with any `<schema>%` siblings) after it, so state
+      outlives multiple layer builds inside one test but never leaks out.
+    - Real event-loop drain AFTER each `TestClock.adjust`/`setTime` (wrapping the
+      TestClock service): async Postgres writes triggered by a clock jump would
+      otherwise land after the assertion.
+    - `OPENCODE_DATABASE_IDLE_TIMEOUT` raised so TestClock jumps don't close
+      pool connections.
+    - Exported `settle` helper for tests that must await background async work.
+  packages/core/test/fixture/database.ts
+    `isolatedDatabase()` -> `Database.configured({ schema: '<env>_target' })`,
+    replacing the old "second SQLite file" pattern
+    (session-create, session-view, repository-cache now use it).
+  Test-side adaptations: shell-parse empty-wasm stub; session-projector reads
+    jsonb as an object (no JSON.parse); session-native/session-runner jsonb_set;
+    preload/session-create/view/repository-cache; integration + location-activity
+    settle; clock-settle fixed LocationActivity eviction.
+
+--------------------------------------------------------------------------------
+5. BRANDING ("dude") plumbing fixes
+--------------------------------------------------------------------------------
+  packages/util/src/brand.ts (APP="dude", LEGACY_APP="opencode", env(), normalizeBrandEnv())
+  packages/util/src/global.ts uses roots(APP, LEGACY_APP); global-roots prefers
+  the new brand unless a legacy dir exists.
+  - packages/core/script/test.ts: OPENCODE_CONFIG_DIR now uses APP (was hardcoded
+    "opencode"); test/preload.test.ts expects the branded XDG dirs.
+  - CLI managed-service tests hardcoded `state/opencode`/`config/opencode` while
+    the CLI resolves `dude`: replaced the path segments with `APP` in
+    test/service.test.ts, service-lifecycle.test.ts, debug-paths.test.ts,
+    debug-config.test.ts, upgrade.test.ts, and script/service-smoke.ts.
+    (Binary/artifact names and the log filename `opencode.log` stay unchanged.)
+
+--------------------------------------------------------------------------------
+6. DEAD SQLITE PLUMBING REMOVED
+--------------------------------------------------------------------------------
+  - packages/core `Database.Options.path` removed (accepted but ignored; pg layer
+    reads OPENCODE_DATABASE_URL/PG*). `layer({})`, `node = configured()`.
+    `pgLayer` dropped its unused `{ filename }` param.
+  - packages/cli/src/database-path.ts deleted; `server-process.ts` no longer
+    passes `database: { path: databasePath(...) }`; `debug paths` lost the `db`
+    selector (commands.ts + handlers/debug/paths.ts).
+  - OPENCODE_DB removed everywhere it was vestigial: cli test fixtures + service
+    tests (fail-boot now uses an unreachable OPENCODE_DATABASE_URL), cli
+    service-smoke, core test preload, desktop configure/bench-startup,
+    app e2e desktop-startup.
+  - ~25 packages/server tests dropped their `database: { path: ... }` config.
+  - sdk/src/internal/host.ts dropped the `path: ":memory:"` default; sdk tests
+    use `database: { schema }` (or the core harness for instances-effect), and
+    sdk/README lost the Workerd section + `database.path` examples.
+
+--------------------------------------------------------------------------------
+7. DOCUMENTATION / VESTIGE CLEANUP
+--------------------------------------------------------------------------------
+  - packages/core/src/database/drizzle/README.md rewritten for PostgreSQL.
+  - packages/sdk/README.md Workerd/`.sqlite` sections removed.
+  - services/www docs: cli/index.mdx + cli/commands.mdx (no `debug paths db`,
+    selectors list updated), cli/providers.mdx (SQLite -> PostgreSQL),
+    troubleshooting.mdx (DB location -> Postgres env), build/sdk/index.mdx link
+    removed, build/sdk/cloudflare.mdx DELETED (documented the removed
+    `@opencode/sdk/workerd`) + removed from docs/lib/navigation.ts.
+  - packages/codemode/script/publish.ts: dropped `bun --conditions=workerd` smoke.
+  - models-dev.ts / schema.gen.ts / kv.ts / pg.ts / db.ts: stale workerd/sqlite
+    comments trimmed or made explicitly historical.
+
+--------------------------------------------------------------------------------
+8. REPO HYGIENE
+--------------------------------------------------------------------------------
+  - .gitignore: added `.wrangler/`.
+  - `git rm --cached services/changelog/.wrangler/**` (7 tracked miniflare
+    `.sqlite*` state files untracked; files kept on disk).
+
+--------------------------------------------------------------------------------
+9. VALIDATION
+--------------------------------------------------------------------------------
+  - `bun run check` (lint + workspace typecheck): GREEN, 34/34 tasks, 0 errors.
+  - `services/www` astro check: 0 errors.
+  - packages/core full suite (after the isolation + semantic fixes):
+      6279 pass / 363 skip / 8 fail across 262 files.
+  - packages/sdk: instances.test.ts + instances-effect.test.ts -> 8/8.
+  - packages/cli: service-lifecycle + service.test -> 32/32;
+      debug-paths/debug-config/upgrade -> 16/16; updater-install -> 30 pass/5 skip;
+      mini-timeout/pair-remote-consent/standalone/web-ui/config/env/mini/cors/
+      session-target -> 56/56.
+
+--------------------------------------------------------------------------------
+10. KNOWN REMAINING FAILURES (core suite, all environment or async-timing)
+--------------------------------------------------------------------------------
+  Environment (not migration bugs; pass on a clean, non-root CI host):
+    - util.flock + util.effect-flock "fails on unwritable lock roots": running
+      as root, chmod 0500 dirs stay writable.
+    - Config "excludes home-level claude..." / "deduplicates global ecosystem...":
+      this machine has /tmp/.claude, found by the upward config walk.
+  Async timing (SQLite was synchronous; TestClock advances virtual time but does
+  not wait for real Postgres I/O):
+    - SessionRunnerLLM retry/backoff + title retry (3 tests): the failure is
+      persisted asynchronously, so the backoff `Effect.sleep` is scheduled at a
+      shifted virtual time and overruns the test's clock budget.
+    - LocationServiceMap "isolates provider state by location": provider
+      transform vs. plugin activation timing (in-memory state, no DB).
+
+--------------------------------------------------------------------------------
+11. INTENTIONALLY KEPT (NOT SQLITE VESTIGES OF THE SERVER DB)
+--------------------------------------------------------------------------------
+  - packages/desktop/*  : node:sqlite local storage (drafts/state/window).
+  - packages/tui/src/editor-zed-sqlite.*  : Zed editor integration.
+  - packages/stats/core/src/r2-sql.test.ts : Cloudflare R2 SQL.
+  - services/update/test/index.test.ts : bun:sqlite used to emulate Cloudflare D1.
+  - packages/ui file-icon (.sqlite extension icon), packages/merman test strings.
+
+================================================================================

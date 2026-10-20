@@ -1,0 +1,65 @@
+name: release-dude
+
+# Builds the dude fork for every platform and publishes the per-platform binary
+# tarballs (dude-<target>.tar.gz) as GitHub release assets, which ./install downloads.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build and release (e.g. 2.1.1). Defaults to the pushed tag."
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-dude-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-bun
+
+      - name: Resolve version
+        id: v
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            version="${{ github.event.inputs.version }}"
+          else
+            version="${GITHUB_REF_NAME#v}"
+          fi
+          version="${version#v}"
+          if [ -z "$version" ]; then
+            echo "::error::No version resolved (push a v* tag or pass the version input)."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Build all platform targets
+        env:
+          # Embeds DUDE_VERSION (version.ts) 1:1 as the release version.
+          DUDE_VERSION: ${{ steps.v.outputs.version }}
+        run: bun run packages/cli/script/build.ts --outdir=dist
+
+      - name: Package release assets
+        run: bash packages/cli/script/package-release.sh packages/cli/dist packages/cli/dist/assets
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ steps.v.outputs.tag }}"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --title "$tag" --notes "dude $tag" --target "$GITHUB_SHA"
+          fi
+          gh release upload "$tag" packages/cli/dist/assets/dude-*.tar.gz --clobber
